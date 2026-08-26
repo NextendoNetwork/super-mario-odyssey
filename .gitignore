@@ -1,0 +1,15 @@
+# Build outputs / compiled servers
+*.exe
+*.linux
+*.out
+/bin/
+/dist/
+
+# Raw / captured binary data
+*.bin
+
+# Secrets & local config — NEVER commit these
+.env
+*.pem
+*.key
+*.pfx

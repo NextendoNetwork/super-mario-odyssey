@@ -160,7 +160,7 @@ func main() {
 // resolveUser: identical identity/gate logic to every other Nextendo game server in this
 // codebase (see arms/main.go's fuller comments) -- signed nx2 token, then bare test PID
 // (1800000000-1810000000, real Switch NSA resolution above that), then anonymous fallback.
-func resolveUser(username string, _ []byte) (uint64, []byte, bool) {
+func resolveUser(username string, extraData []byte) (uint64, []byte, bool) {
 	sk := sha256.Sum256([]byte("nextendo-src:" + username))
 	sourceKey := sk[:]
 
@@ -173,11 +173,17 @@ func resolveUser(username string, _ []byte) (uint64, []byte, bool) {
 	}
 
 	if n, err := strconv.ParseUint(username, 10, 64); err == nil && n >= 1800000000 {
-		if requireSignedToken() {
-			fmt.Printf("[Auth] pid=%d REFUSED: bare-PID identity disabled (signed nx2 token required)\n", n)
-			return 0, nil, false
+		// Emulators prove the PID with the nx2 token carried in the BAAS id_token (extraData).
+		if n < 1810000000 {
+			provenPID, proven := uint64(0), false
+			if tok, ok := nex.NexTokenFromLoginExtraData(extraData); ok {
+				provenPID, proven = nextendoPIDFromToken(tok)
+			}
+			if requireSignedToken() && !(proven && provenPID == n) {
+				fmt.Printf("[Auth] pid=%d REFUSED: identity not proven (signed nx2 token required)\n", n)
+				return 0, nil, false
+			}
 		}
-		fmt.Printf("[Auth] pid=%d bare-PID identity (unauthenticated -- see NEXTENDO_REQUIRE_SIGNED_TOKEN)\n", n)
 		pid, kind := n, "ryujinx"
 		if n >= 1810000000 {
 			kind = "switch"
@@ -193,12 +199,11 @@ func resolveUser(username string, _ []byte) (uint64, []byte, bool) {
 				fmt.Printf("[Auth] NSA %d REFUSED (account server unreachable)\n", n)
 				return 0, nil, false
 			}
-			if allow, reason := nextendoOnlineCheck(pid, kind); !allow {
-				fmt.Printf("[Auth] pid=%d online REFUSED (%s)\n", pid, reason)
-				return 0, nil, false
-			}
 		}
-		// bare "ryujinx" test-PIDs stay exempt from online-check: they're never registered accounts
+		if allow, reason := nextendoOnlineCheck(pid, kind); !allow {
+			fmt.Printf("[Auth] pid=%d online REFUSED (%s)\n", pid, reason)
+			return 0, nil, false
+		}
 		return pid, sourceKey, true
 	}
 

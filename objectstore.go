@@ -86,6 +86,7 @@ func objectDelete(dataID uint64) {
 
 func startObjectStore() {
 	mux := http.NewServeMux()
+	registerAvatarCDN(mux)
 	mux.HandleFunc("/object/", func(w http.ResponseWriter, r *http.Request) {
 		var dataID uint64
 		if _, err := fmt.Sscanf(r.URL.Path, "/object/%d", &dataID); err != nil {

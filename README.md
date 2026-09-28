@@ -72,20 +72,34 @@ Implemented for real (see `datastore.go`), backed by an in-memory map flushed to
 - `SearchObject` (12): generic search, filtered by `dataType` only (the rest of
   `DataStoreSearchParam`'s fields aren't decoded, same "don't risk desyncing on an unconfirmed
   layout" call `ranking.go` makes for `GetRanking`)
-- `RateObject` / `GetRating` (15/16): Balloon World's rating claps
+- `RateObject` / `GetRating` / `RateObjects` (15/16/40): per-slot ratings stored as
+  `DataStoreRatingInfo` structures; a find rates the owner's stats record (`ownerDataId`)
+- `PostMetaBinary` (21): the stats record (type 200) and per-kingdom balloons
+- `GetPersistenceInfo` (29): used when a balloon is looked up by its code
 - The full SMO extension (47–53): `AddToBufferQueue(s)` / `GetBufferQueue(s)` /
   `ClearBufferQueues` (the capture-pose screenshot buffers), `SearchBalloon`, `FetchMyInfos`
 
 Everything else on the base DataStore method list (46 methods total, see the wiki) falls
-through to `notImplementedDS`, logged with the full method ID + body so a real capture can
-fill it in fast if Odyssey turns out to need it.
+through to `notImplementedDS`, logged with the full method ID + body.
 
-**None of the wire shapes here have been cross-checked against a real Odyssey capture**:
-they're transcribed from the kinnay wiki's documented (generic NEX, not Odyssey-specific)
-layout. Field-level mistakes are plausible, especially around `SearchBalloon`'s result
-bucketing (the exact per-kingdom/rank grouping rule Nintendo uses isn't known) and
-`AddToBufferQueue`'s `BufferQueueParam` slot field width. Every DataStore call is logged with
-proto+method+pid+body length so a live test quickly shows what needs correcting.
+Hide It, Find It, balloon codes, names and profile pictures have been played end to end on
+Citron. `SearchBalloon`'s result bucketing (the exact per-kingdom/rank grouping rule Nintendo
+uses) is still unknown, and every balloon currently sits in the first reward tier.
+
+## Balloon World settings
+
+Hide time, find-time fallback, Play cost, Reward tiers and the hider's payout all come from
+`Utility.GetIntegerSettings` (`utility.go`); the game reads a missing key as 0 (which is what
+made the Hide It timer show 0 seconds). Nintendo's real values are unknown: the coin economy
+values in `utility.go` are chosen to match the documented behaviour (30s to hide, 3–40s to find,
+Reward a little over 3× the Play cost).
+
+## Profile pictures
+
+The game downloads each balloon owner's picture from `cdn-image-<baas>.baas.nintendo.com` and
+decodes it straight into a buffer sized for the `ImageSize` it asked for, so the reply must be
+exactly that size. `avatar.go` serves `/1/<thumb>?pid=<pid>&size=<px>` on the object store port
+from the player's Nextendo avatar; route that SNI host to `OBJECT_PORT`.
 
 ## Running
 

@@ -11,7 +11,6 @@
 package main
 
 import (
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -19,7 +18,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf16"
 
 	nex "github.com/NextendoNetwork/nextendo-nex"
 )
@@ -42,6 +40,7 @@ const (
 	methodPreparePostObject  uint32 = 24
 	methodPrepareGetObject   uint32 = 25
 	methodCompletePostObject uint32 = 26
+	methodGetPersistenceInfo uint32 = 29
 
 	// SMO's own extension (Data-Store-Protocol-(SMO)).
 	methodAddToBufferQueue  uint32 = 47
@@ -79,6 +78,15 @@ type balloonRecord struct {
 	Buffers     map[int8][][]byte
 	RatingSum   int64
 	RatingN     uint32
+	Ratings     map[int8]ratingInfo // per slot, seeded from the post's ratingInitParams
+	Slot        *uint16             // persistence slot from the post, nil if none
+}
+
+// ratingInfo mirrors DataStoreRatingInfo, the value type of Odyssey's per-slot ratings maps.
+type ratingInfo struct {
+	Total   int64
+	Count   uint32
+	Initial int64
 }
 
 var (
@@ -110,6 +118,8 @@ type persistedRecord struct {
 	Complete             bool
 	RatingSum            int64
 	RatingN              uint32
+	Ratings              map[int8]ratingInfo
+	Slot                 *uint16 `json:",omitempty"`
 }
 
 func dsLoad() {
@@ -132,7 +142,8 @@ func dsLoad() {
 			DataID: r.DataID, OwnerID: r.OwnerID, Size: r.Size, Name: r.Name,
 			DataType: r.DataType, MetaBinary: r.MetaBinary, Tags: r.Tags,
 			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, CreatedWall: wall, Complete: r.Complete,
-			Buffers: map[int8][][]byte{}, RatingSum: r.RatingSum, RatingN: r.RatingN,
+			Buffers: map[int8][][]byte{}, RatingSum: r.RatingSum, RatingN: r.RatingN, Ratings: r.Ratings,
+			Slot: r.Slot,
 		}
 		if r.DataID >= dsNextID.Load() {
 			dsNextID.Store(r.DataID + 1)
@@ -155,7 +166,8 @@ func dsFlusher() {
 					DataID: r.DataID, OwnerID: r.OwnerID, Size: r.Size, Name: r.Name,
 					DataType: r.DataType, MetaBinary: r.MetaBinary, Tags: r.Tags,
 					CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, CreatedWallUnix: r.CreatedWall.Unix(),
-					Complete: r.Complete, RatingSum: r.RatingSum, RatingN: r.RatingN,
+					Complete: r.Complete, RatingSum: r.RatingSum, RatingN: r.RatingN, Ratings: r.Ratings,
+					Slot: r.Slot,
 				})
 			}
 			dsMu.Unlock()
@@ -183,6 +195,8 @@ func DataStoreHandler() nex.RMCHandler {
 			return dsPreparePostObject(conn, req)
 		case methodCompletePostObject:
 			return dsCompletePostObject(conn, req)
+		case methodGetPersistenceInfo:
+			return dsGetPersistenceInfo(conn, req)
 		case methodPrepareGetObject:
 			return dsPrepareGetObject(conn, req)
 		case methodDeleteObject:
@@ -223,16 +237,128 @@ func notImplementedDS(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage
 	return nex.NewRMCError(conn.Settings, protocolDataStore, req.CallID, nex.ResultCoreNotImplemented)
 }
 
-// readPermission consumes a DataStorePermission (Uint8 permission, List<PID> recipientIds) --
-// we don't enforce it, just need to advance the stream cursor correctly for whatever follows.
+// readPermission skips a DataStorePermission [Structure]; it is not enforced.
 func readPermission(in *nex.StreamIn) {
-	in.U8()
-	nex.ReadList(in, func(in *nex.StreamIn) uint64 { return in.PID() })
+	p := readStructHeader(in)
+	p.U8()
+	nex.ReadList(p, func(in *nex.StreamIn) uint64 { return in.PID() })
 }
 
+// readRatingInitParams reads List<DataStoreRatingInitParamWithSlot{slot s8, DataStoreRatingInitParam}>
+// and keeps each slot's initialValue. Odyssey reads slots 2 and 3 back without checking they exist.
+func readRatingInitParams(in *nex.StreamIn) map[int8]ratingInfo {
+	out := map[int8]ratingInfo{}
+	nex.ReadList(in, func(in *nex.StreamIn) struct{} {
+		ws := readStructHeader(in)
+		slot := ws.S8()
+		p := readStructHeader(ws)
+		p.U8()             // flag
+		p.U8()             // internalFlag
+		p.U8()             // lockType
+		initial := p.S64() // initialValue
+		p.S32()            // rangeMin
+		p.S32()            // rangeMax
+		p.S8()             // periodHour
+		p.S16()            // periodDuration
+		if ws.Err() == nil && p.Err() == nil {
+			out[slot] = ratingInfo{Total: initial, Initial: initial}
+		}
+		return struct{}{}
+	})
+	return out
+}
+
+// readPersistenceSlot reads DataStorePersistenceInitParam; 0xFFFF means not persistent.
+func readPersistenceSlot(in *nex.StreamIn) *uint16 {
+	p := readStructHeader(in)
+	slot := p.U16()
+	p.Bool() // deleteLastObject
+	if p.Err() != nil || in.Err() != nil || slot == 0xFFFF {
+		return nil
+	}
+	return &slot
+}
+
+// dsGetPersistenceInfo answers GetPersistenceInfo(ownerId, persistenceSlotId) with the owner's
+// newest balloon in that slot; records posted before slots were stored match any slot.
+func dsGetPersistenceInfo(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
+	s := conn.Settings
+	in := nex.NewStreamIn(req.Body, s)
+	owner := in.PID()
+	slot := in.U16()
+	if in.Err() != nil {
+		return nex.NewRMCError(s, protocolDataStore, req.CallID, nex.ResultCoreInvalidArgument)
+	}
+	dsMu.Lock()
+	var best *balloonRecord
+	for _, r := range dsRecords {
+		if !r.Complete || r.OwnerID != owner || r.DataType == smoAchievementDataType {
+			continue
+		}
+		if r.Slot != nil && *r.Slot != slot {
+			continue
+		}
+		if best == nil || r.CreatedAt > best.CreatedAt {
+			best = r
+		}
+	}
+	var dataID uint64
+	if best != nil {
+		dataID = best.DataID
+	}
+	dsMu.Unlock()
+	fmt.Printf("[SMO Balloon] pid=%d GetPersistenceInfo owner=%d slot=%d -> dataId=%d\n", conn.PID, owner, slot, dataID)
+	if best == nil {
+		return nex.NewRMCError(s, protocolDataStore, req.CallID, resultDataStoreNotFound)
+	}
+	out := nex.NewStreamOut(s)
+	writeStructHeader(out, func(o *nex.StreamOut) {
+		o.PID(owner)
+		o.U16(slot)
+		o.U64(dataID)
+	})
+	return nex.NewRMCSuccess(s, protocolDataStore, req.Method, req.CallID, out.Bytes())
+}
+
+// ratingsOf returns a record's per-slot ratings, never nil.
+func ratingsOf(r *balloonRecord) map[int8]ratingInfo {
+	out := map[int8]ratingInfo{}
+	if r != nil {
+		for k, v := range r.Ratings {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// addRating applies one rating to a slot; sessionsMu-style locking is the caller's (dsMu).
+func addRating(r *balloonRecord, slot int8, value int64) {
+	if r.Ratings == nil {
+		r.Ratings = map[int8]ratingInfo{}
+	}
+	info := r.Ratings[slot]
+	info.Total += value
+	info.Count++
+	r.Ratings[slot] = info
+}
+
+// writeRatings sends Map<Int8, DataStoreRatingInfo>; each value is its own [Structure].
+func writeRatings(o *nex.StreamOut, m map[int8]ratingInfo) {
+	nex.WriteMap(o, m, func(o *nex.StreamOut, k int8) { o.S8(k) }, func(o *nex.StreamOut, v ratingInfo) {
+		writeStructHeader(o, func(o *nex.StreamOut) {
+			o.S64(v.Total)
+			o.U32(v.Count)
+			o.S64(v.Initial)
+		})
+	})
+}
+
+// writePermission sends a public DataStorePermission [Structure].
 func writePermission(out *nex.StreamOut) {
-	out.U8(0) // 0 = public, matches "anyone can find this balloon"
-	nex.WriteList(out, []uint64{}, func(o *nex.StreamOut, v uint64) { o.PID(v) })
+	writeStructHeader(out, func(o *nex.StreamOut) {
+		o.U8(0)
+		nex.WriteList(o, []uint64{}, func(o *nex.StreamOut, v uint64) { o.PID(v) })
+	})
 }
 
 // readStructHeader consumes a flat (non-inherited) Structure's [u8 version][u32 length] wire
@@ -329,20 +455,13 @@ func dsGetMeta(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
 	}
 	dsMu.Lock()
 	r, ok := dsRecords[dataID]
-	var knownIDs []uint64
-	for id := range dsRecords {
-		knownIDs = append(knownIDs, id)
-	}
 	dsMu.Unlock()
-	fmt.Printf("[SMO Balloon] GetMeta pid=%d requested dataId=%d resultOption=%#x found=%v knownIds=%v\n",
-		conn.PID, dataID, resultOption, ok, knownIDs)
+	fmt.Printf("[SMO Balloon] pid=%d GetMeta dataId=%d found=%v\n", conn.PID, dataID, ok)
 	if !ok {
 		return nex.NewRMCError(s, protocolDataStore, req.CallID, resultDataStoreNotFound)
 	}
 	out := nex.NewStreamOut(s)
 	out.Add(&metaInfoStruct{r: r, includeMetaBinary: resultOption&resultOptionMetaBinary != 0})
-	fmt.Printf("[SMO Balloon] GetMeta pid=%d responding with dataId=%d ownerId=%d type=%d metaLen=%d includeMetaBinary=%v respBytes=%x\n",
-		conn.PID, r.DataID, r.OwnerID, r.DataType, len(r.MetaBinary), resultOption&resultOptionMetaBinary != 0, out.Bytes())
 	return nex.NewRMCSuccess(s, protocolDataStore, req.Method, req.CallID, out.Bytes())
 }
 
@@ -394,17 +513,18 @@ func dsPreparePostObject(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMess
 	in.U16()           // period
 	in.U32()           // referDataId
 	tags := nex.ReadList(in, func(in *nex.StreamIn) string { return in.String() })
-	// ratingInitParams / persistenceInitParam / extraData follow -- not needed to answer.
 	if in.Err() != nil {
 		return nex.NewRMCError(s, protocolDataStore, req.CallID, nex.ResultCoreInvalidArgument)
 	}
+	ratings := readRatingInitParams(in)
+	slot := readPersistenceSlot(in)
 
 	dataID := dsNextID.Add(1) - 1
 	now := nex.NowDateTime().Value()
 	rec := &balloonRecord{
 		DataID: dataID, OwnerID: conn.PID, Size: size, Name: name, DataType: dataType,
 		MetaBinary: metaBinary, Tags: tags, CreatedAt: now, UpdatedAt: now, CreatedWall: time.Now(),
-		Buffers: map[int8][][]byte{},
+		Buffers: map[int8][][]byte{}, Ratings: ratings, Slot: slot,
 	}
 	dsMu.Lock()
 	dsRecords[dataID] = rec
@@ -423,8 +543,8 @@ func dsPreparePostObject(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMess
 		nex.WriteList(o, []struct{ k, v string }{}, func(o *nex.StreamOut, kv struct{ k, v string }) {}) // formFields
 		o.Buffer(nil)                                                                                    // rootCaCert: none, our own self-signed cert is already trusted by the console via its normal chain
 	})
-	fmt.Printf("[SMO Balloon] pid=%d PreparePostObject -> dataId=%d name=%q type=%d size=%d\n",
-		conn.PID, dataID, name, dataType, size)
+	fmt.Printf("[SMO Balloon] pid=%d PreparePostObject -> dataId=%d name=%q type=%d size=%d ratings=%v\n",
+		conn.PID, dataID, name, dataType, size, ratings)
 	return nex.NewRMCSuccess(s, protocolDataStore, req.Method, req.CallID, out.Bytes())
 }
 
@@ -447,10 +567,11 @@ func dsPostMetaBinary(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage
 	in.U16()           // period
 	in.U32()           // referDataId
 	tags := nex.ReadList(in, func(in *nex.StreamIn) string { return in.String() })
-	// ratingInitParams / persistenceInitParam / extraData follow -- not needed to answer.
 	if in.Err() != nil {
 		return nex.NewRMCError(s, protocolDataStore, req.CallID, nex.ResultCoreInvalidArgument)
 	}
+	ratings := readRatingInitParams(in)
+	slot := readPersistenceSlot(in)
 
 	dataID := dsNextID.Add(1) - 1
 	now := nex.NowDateTime().Value()
@@ -459,6 +580,8 @@ func dsPostMetaBinary(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage
 		MetaBinary: metaBinary, Tags: tags, CreatedAt: now, UpdatedAt: now, CreatedWall: time.Now(),
 		Complete: true, // no separate CompletePostObject call for this method
 		Buffers:  map[int8][][]byte{},
+		Ratings:  ratings,
+		Slot:     slot,
 	}
 	dsMu.Lock()
 	dsRecords[dataID] = rec
@@ -468,8 +591,8 @@ func dsPostMetaBinary(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage
 
 	out := nex.NewStreamOut(s)
 	out.U64(dataID)
-	fmt.Printf("[SMO Balloon] pid=%d PostMetaBinary -> dataId=%d name=%q type=%d size=%d metaLen=%d (replaced dataId=%d)\n",
-		conn.PID, dataID, name, dataType, size, len(metaBinary), replaced)
+	fmt.Printf("[SMO Balloon] pid=%d PostMetaBinary -> dataId=%d name=%q type=%d size=%d metaLen=%d ratings=%v (replaced dataId=%d)\n",
+		conn.PID, dataID, name, dataType, size, len(metaBinary), ratings, replaced)
 	return nex.NewRMCSuccess(s, protocolDataStore, req.Method, req.CallID, out.Bytes())
 }
 
@@ -615,7 +738,7 @@ func dsRateObject(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
 	s := conn.Settings
 	in := nex.NewStreamIn(req.Body, s)
 	dataID := in.U64()
-	in.S8()           // slot
+	slot := in.S8()
 	value := in.S64() // ratingValue
 	if in.Err() != nil {
 		return nex.NewRMCError(s, protocolDataStore, req.CallID, nex.ResultCoreInvalidArgument)
@@ -624,6 +747,7 @@ func dsRateObject(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
 	if r, ok := dsRecords[dataID]; ok {
 		r.RatingSum += value
 		r.RatingN++
+		addRating(r, slot, value)
 	}
 	dsMu.Unlock()
 	dsMarkDirty()
@@ -707,6 +831,7 @@ func dsRateObjects(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
 		}
 		r.RatingSum += int64(params[i].ratingValue)
 		r.RatingN++
+		addRating(r, targets[i].slot, int64(params[i].ratingValue))
 		ratings[i] = r
 		results[i] = nex.SuccessResult(0).Code
 	}
@@ -727,7 +852,7 @@ func dsRateObjects(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
 		})
 	})
 	nex.WriteList(out, results, func(o *nex.StreamOut, v uint32) { o.U32(v) })
-	fmt.Printf("[SMO Balloon] pid=%d RateObjects %d target(s)\n", conn.PID, n)
+	fmt.Printf("[SMO Balloon] pid=%d RateObjects %v results=%x\n", conn.PID, targets[:n], results)
 	return nex.NewRMCSuccess(s, protocolDataStore, req.Method, req.CallID, out.Bytes())
 }
 
@@ -890,10 +1015,6 @@ var (
 
 func dsSearchBalloon(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
 	s := conn.Settings
-	// TEMP DIAG: bodyLen has consistently been 10, not the 9 my assumed layout (5-byte struct
-	// header + u16 dataType + u8 userRank + u8 resultSetCount) predicts -- dump raw bytes to
-	// find the real layout instead of continuing to guess.
-	fmt.Printf("[SMO Balloon] SearchBalloon RAW body=%x\n", req.Body)
 	in := readStructHeader(nex.NewStreamIn(req.Body, s)) // DataStoreSearchBalloonParam ([Structure])
 	dataType := in.U16()
 	in.U8() // userRank
@@ -923,6 +1044,20 @@ func dsSearchBalloon(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage 
 		}
 		pool = append(pool, r)
 	}
+	ratingSnap := map[uint64]map[int8]ratingInfo{}
+	ownerSnap := map[uint64]map[int8]ratingInfo{}
+	ownerStats := map[uint64]uint64{}
+	var ownerAt = map[uint64]uint64{}
+	for _, r := range dsRecords {
+		if r.Complete && r.DataType == smoAchievementDataType && r.CreatedAt >= ownerAt[r.OwnerID] {
+			ownerAt[r.OwnerID] = r.CreatedAt
+			ownerSnap[r.OwnerID] = ratingsOf(r)
+			ownerStats[r.OwnerID] = r.DataID
+		}
+	}
+	for _, r := range pool {
+		ratingSnap[r.DataID] = ratingsOf(r)
+	}
 	dsMu.Unlock()
 	sort.Slice(pool, func(i, j int) bool { return pool[i].CreatedAt > pool[j].CreatedAt })
 
@@ -944,13 +1079,7 @@ func dsSearchBalloon(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage 
 					o.QBuffer(r.MetaBinary)
 					o.DateTime(r.CreatedAt)
 					o.DateTime(r.UpdatedAt)
-					// ownerDataId: the generic wiki doesn't say what this is for; live-tested
-					// 2026-08-23 with 0 here and the client showed "0 seconds" to find the
-					// balloon (real location/distance rendered fine, only the time was wrong)
-					// -- testing whether Odyssey repurposes this Uint64 as the challenge's
-					// time limit in seconds. Real Balloon World "Find It" runs are commonly
-					// ~60s; try 60 first.
-					o.U64(60)
+					o.U64(ownerStats[r.OwnerID]) // ownerDataId: the stats record a find rates
 					// ownerName: real bug found via live testing 2026-08-23 -- this was hardcoded
 					// empty on the (wrong) assumption the client resolves the display name itself
 					// via friends/BAAS. It doesn't: an empty String here rendered as a fixed-width
@@ -958,10 +1087,12 @@ func dsSearchBalloon(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage 
 					// Always send something real rather than empty.
 					o.String(dispName(r.OwnerID))
 					o.Bool(false) // isFriendBalloon: we don't cross-reference the friends list here
-					nex.WriteMap(o, map[int8]int64{}, func(o *nex.StreamOut, k int8) { o.S8(k) },
-						func(o *nex.StreamOut, v int64) { o.S64(v) }) // ratings: not exposed per-slot yet
-					nex.WriteMap(o, map[int8]int64{}, func(o *nex.StreamOut, k int8) { o.S8(k) },
-						func(o *nex.StreamOut, v int64) { o.S64(v) }) // ownerRatings
+					writeRatings(o, ratingSnap[r.DataID])
+					owner := ownerSnap[r.OwnerID]
+					if owner == nil {
+						owner = map[int8]ratingInfo{}
+					}
+					writeRatings(o, owner) // ownerRatings: the placer's own stats record
 				})
 			})
 		})
@@ -1007,23 +1138,13 @@ func splitIntoSets(pool []*balloonRecord, n int) [][]*balloonRecord {
 // breaks the loop.
 const smoAchievementDataType uint16 = 200
 
-// buildAchievementMetaBinary synthesizes the stats blob content: the client has never once sent
-// real bytes here, and a real captured FetchMyInfos response proved our own wire framing is
-// byte-exact correct (dataID/dataType/QBuffer length/name all land exactly where our code puts
-// them) -- so the corruption isn't an encoding bug, it's that the client expects the name at a
-// different byte offset (or a different total size) than offset 0. DIAGNOSTIC BUILD: plants a
-// distinct "@NNN" marker (UTF-16LE) every 16 bytes across the buffer instead of one name at
-// offset 0 -- whichever marker renders legibly in-game tells us the real offset directly. Revert
-// to a single name at the confirmed offset once known.
-func buildAchievementMetaBinary(pid uint64) []byte {
-	buf := make([]byte, 256)
-	for slot := 0; slot < 256; slot += 16 {
-		marker := fmt.Sprintf("@%03d", slot)
-		for i, u := range utf16.Encode([]rune(marker)) {
-			binary.LittleEndian.PutUint16(buf[slot+i*2:], u)
-		}
+// Achievement metadata is an opaque client-owned payload. Never synthesize
+// diagnostic text into it: the game interprets these bytes as binary fields.
+func achievementPayload(r *balloonRecord) ([]byte, uint64) {
+	if r == nil {
+		return nil, 0
 	}
-	return buf
+	return append([]byte(nil), r.MetaBinary...), r.CreatedAt
 }
 
 func dsFetchMyInfos(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
@@ -1075,6 +1196,11 @@ func dsFetchMyInfos(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
 		}
 		mine = append(mine, r)
 	}
+	ratingSnap := map[uint64]map[int8]ratingInfo{}
+	for _, r := range mine {
+		ratingSnap[r.DataID] = ratingsOf(r)
+	}
+	achievementRatings := ratingsOf(achievement)
 	dsMu.Unlock()
 	sort.Slice(mine, func(i, j int) bool { return mine[i].CreatedAt > mine[j].CreatedAt })
 
@@ -1093,8 +1219,7 @@ func dsFetchMyInfos(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
 				o.DateTime(r.CreatedAt)
 				o.DateTime(r.UpdatedAt)
 				o.Bool(found[r.DataID]) // isCleared: whether the placer's OWN balloon has been popped by someone
-				nex.WriteMap(o, map[int8]int64{}, func(o *nex.StreamOut, k int8) { o.S8(k) },
-					func(o *nex.StreamOut, v int64) { o.S64(v) }) // ratings
+				writeRatings(o, ratingSnap[r.DataID])
 				nex.WriteMap(o, map[int8][][]byte{}, func(o *nex.StreamOut, k int8) { o.S8(k) },
 					func(o *nex.StreamOut, v [][]byte) {
 						nex.WriteList(o, v, func(o *nex.StreamOut, b []byte) { o.QBuffer(b) })
@@ -1105,11 +1230,6 @@ func dsFetchMyInfos(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
 		// record if PostMetaBinary has posted one, so the client sees its own sync reflected
 		// back instead of looping forever (see smoAchievementDataType's comment above).
 		//
-		// The DateTime field here is a "now" sync anchor the client uses to compute the Hide
-		// It/Find It challenge timer, not the achievement record's real creation time -- echoing
-		// achievement.CreatedAt (set once, when the record was first posted) goes stale the
-		// moment real time has passed since then, reproducing the same "elapsed time clamps to
-		// 0 seconds" bug the nil-achievement fallback below was already fixed for. Always "now".
 		writeStructHeader(o, func(o *nex.StreamOut) {
 			dataID, dataType := uint64(0), uint16(0)
 			if achievement != nil {
@@ -1117,10 +1237,10 @@ func dsFetchMyInfos(conn *nex.Connection, req *nex.RMCMessage) *nex.RMCMessage {
 			}
 			o.U64(dataID)
 			o.U16(dataType)
-			o.QBuffer(buildAchievementMetaBinary(conn.PID))
+			metadata, _ := achievementPayload(achievement)
+			o.QBuffer(metadata)
 			o.DateTime(nex.NowDateTime().Value())
-			nex.WriteMap(o, map[int8]int64{}, func(o *nex.StreamOut, k int8) { o.S8(k) },
-				func(o *nex.StreamOut, v int64) { o.S64(v) })
+			writeRatings(o, achievementRatings)
 			nex.WriteMap(o, map[int8][][]byte{}, func(o *nex.StreamOut, k int8) { o.S8(k) },
 				func(o *nex.StreamOut, v [][]byte) {
 					nex.WriteList(o, v, func(o *nex.StreamOut, b []byte) { o.QBuffer(b) })

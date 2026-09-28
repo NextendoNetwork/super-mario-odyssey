@@ -111,7 +111,7 @@ func main() {
 	secureEndpoint.SetSecureAccount(securePassword, securePID)
 
 	secureEndpoint.Register(nex.ProtocolSecureConnection, nex.SecureConnectionHandler())
-	secureEndpoint.Register(nex.ProtocolUtility, nex.UtilityHandler())
+	secureEndpoint.Register(nex.ProtocolUtility, smoUtilityHandler())
 	// Ranking (0x70) costs three lines and is harmless to register even if Odyssey's client
 	// never links a RankingProtocolClient -- same call ARMS's main.go makes for the same
 	// reason. DataStore (0x73) is the real implementation, not a stub -- see datastore.go.
